@@ -206,6 +206,9 @@ enum {
 #define BLUETOOTH_PREFER_HSP "bluetooth.prefer.hsp"
 
 static int init_profile(struct userdata *u);
+static int bt_transport_setup(struct userdata *u);
+static int bt_transport_acquire(struct userdata *u, bool optional);
+static void bt_transport_config(struct userdata *u);
 
 /* from IO thread */
 static void a2dp_set_bitpool(struct userdata *u, uint8_t bitpool) {
@@ -358,13 +361,10 @@ static void bt_transport_release(struct userdata *u) {
     teardown_stream(u);
 }
 
-static int bt_transport_acquire(struct userdata *u, bool optional) {
+static int transport_acquire(struct userdata *u, bool optional) {
     pa_assert(u->transport);
 
-    if (u->transport_acquired)
-        return 0;
-
-    pa_log_debug("Acquiring transport %s", u->transport->path);
+    pa_log_debug("Acquiring transport %s%s", u->transport->path, optional ? " (optional)" : "");
 
     u->stream_fd = pa_bluez4_transport_acquire(u->transport, optional, &u->read_link_mtu, &u->write_link_mtu);
     if (u->stream_fd < 0) {
@@ -1402,8 +1402,11 @@ static void sink_set_volume_cb(pa_sink *s) {
     k = pa_sprintf_malloc("bluetooth-device@%p", (void*) s);
     u = pa_shared_get(s->core, k);
     pa_xfree(k);
+    if (!u) {
+        pa_log("sink_set_volume_cb: SCO shared device disappeared");
+        return;
+    }
 
-    pa_assert(u);
     pa_assert(u->sink == s);
     pa_assert(u->profile == PA_BLUEZ4_PROFILE_HEADSET_HEAD_UNIT);
     pa_assert(u->transport);
@@ -1429,8 +1432,11 @@ static void source_set_volume_cb(pa_source *s) {
     k = pa_sprintf_malloc("bluetooth-device@%p", (void*) s);
     u = pa_shared_get(s->core, k);
     pa_xfree(k);
+    if (!u) {
+        pa_log("source_set_volume_cb: SCO shared device disappeared");
+        return;
+    }
 
-    pa_assert(u);
     pa_assert(u->source == s);
     pa_assert(u->profile == PA_BLUEZ4_PROFILE_HEADSET_HEAD_UNIT);
     pa_assert(u->transport);
@@ -1475,11 +1481,12 @@ static char *get_name(const char *type, pa_modargs *ma, const char *device_id, c
         return pa_sprintf_malloc("bluez_%s.%s", type, n);
 }
 
-static int sco_over_pcm_state_update(struct userdata *u, bool changed) {
+static int sco_over_pcm_state_update(struct userdata *u, bool initial, bool changed) {
     pa_assert(u);
     pa_assert(USE_SCO_OVER_PCM(u));
 
-    if (PA_SINK_IS_OPENED(u->hsp.sco_sink->state) ||
+    if (initial ||
+        PA_SINK_IS_OPENED(u->hsp.sco_sink->state) ||
         PA_SOURCE_IS_OPENED(u->hsp.sco_source->state)) {
 
         if (u->stream_fd >= 0)
@@ -1523,7 +1530,8 @@ static pa_hook_result_t sink_state_changed_cb(pa_core *c, pa_sink *s, struct use
     if (!USE_SCO_OVER_PCM(u) || s != u->hsp.sco_sink)
         return PA_HOOK_OK;
 
-    sco_over_pcm_state_update(u, true);
+    pa_log_debug("bluez4 SCO sink state changed");
+    sco_over_pcm_state_update(u, false, true);
 
     return PA_HOOK_OK;
 }
@@ -1536,7 +1544,8 @@ static pa_hook_result_t source_state_changed_cb(pa_core *c, pa_source *s, struct
     if (!USE_SCO_OVER_PCM(u) || s != u->hsp.sco_source)
         return PA_HOOK_OK;
 
-    sco_over_pcm_state_update(u, true);
+    pa_log_debug("bluez4 SCO source state changed");
+    sco_over_pcm_state_update(u, false, true);
 
     return PA_HOOK_OK;
 }
@@ -1654,6 +1663,7 @@ static int add_sink(struct userdata *u) {
         data.card = u->card;
         data.name = get_name("sink", u->modargs, u->address, pa_bluez4_profile_to_string(u->profile), &b);
         data.namereg_fail = b;
+        data.suspend_cause = PA_SUSPEND_IDLE;
 
         if (pa_modargs_get_proplist(u->modargs, "sink_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
             pa_log("Invalid properties");
@@ -1662,19 +1672,8 @@ static int add_sink(struct userdata *u) {
         }
         connect_ports(u, &data, PA_DIRECTION_OUTPUT);
 
-        if (!u->transport_acquired)
-            switch (u->profile) {
-                case PA_BLUEZ4_PROFILE_A2DP_SINK:
-                case PA_BLUEZ4_PROFILE_HEADSET_HEAD_UNIT:
-                    pa_assert_not_reached(); /* Profile switch should have failed */
-                    break;
-                case PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY:
-                    data.suspend_cause = PA_SUSPEND_USER;
-                    break;
-                case PA_BLUEZ4_PROFILE_A2DP_SOURCE:
-                case PA_BLUEZ4_PROFILE_OFF:
-                    pa_assert_not_reached();
-            }
+        if (!u->transport_acquired && u->profile == PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY)
+            data.suspend_cause |= PA_SUSPEND_USER;
 
         u->sink = pa_sink_new(u->core, &data, PA_SINK_HARDWARE|PA_SINK_LATENCY);
         pa_sink_new_data_done(&data);
@@ -1726,6 +1725,7 @@ static int add_source(struct userdata *u) {
         data.card = u->card;
         data.name = get_name("source", u->modargs, u->address, pa_bluez4_profile_to_string(u->profile), &b);
         data.namereg_fail = b;
+        data.suspend_cause = PA_SUSPEND_IDLE;
 
         if (pa_modargs_get_proplist(u->modargs, "source_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
             pa_log("Invalid properties");
@@ -1735,19 +1735,8 @@ static int add_source(struct userdata *u) {
 
         connect_ports(u, &data, PA_DIRECTION_INPUT);
 
-        if (!u->transport_acquired)
-            switch (u->profile) {
-                case PA_BLUEZ4_PROFILE_HEADSET_HEAD_UNIT:
-                    pa_assert_not_reached(); /* Profile switch should have failed */
-                    break;
-                case PA_BLUEZ4_PROFILE_A2DP_SOURCE:
-                case PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY:
-                    data.suspend_cause = PA_SUSPEND_USER;
-                    break;
-                case PA_BLUEZ4_PROFILE_A2DP_SINK:
-                case PA_BLUEZ4_PROFILE_OFF:
-                    pa_assert_not_reached();
-            }
+        if (!u->transport_acquired && u->profile == PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY)
+            data.suspend_cause |= PA_SUSPEND_USER;
 
         u->source = pa_source_new(u->core, &data, PA_SOURCE_HARDWARE|PA_SOURCE_LATENCY);
         pa_source_new_data_done(&data);
@@ -1915,7 +1904,7 @@ static pa_hook_result_t transport_state_changed_cb(pa_bluez4_discovery *y, pa_bl
 }
 
 /* Run from main thread */
-static int setup_transport(struct userdata *u) {
+static int bt_transport_setup(struct userdata *u) {
     pa_bluez4_transport *t;
 
     pa_assert(u);
@@ -1931,12 +1920,21 @@ static int setup_transport(struct userdata *u) {
 
     u->transport = t;
 
-    if (u->profile == PA_BLUEZ4_PROFILE_A2DP_SOURCE || u->profile == PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY)
-        bt_transport_acquire(u, true); /* In case of error, the sink/sources will be created suspended */
-    else if (bt_transport_acquire(u, false) < 0)
-        return -1; /* We need to fail here until the interactions with module-suspend-on-idle and alike get improved */
+    return 0;
+}
 
-    bt_transport_config(u);
+static int bt_transport_acquire(struct userdata *u, bool optional) {
+    pa_assert(u);
+
+    if (u->transport_acquired) {
+        pa_log_debug("Transport already acquired");
+        return 0;
+    }
+
+    if (u->profile == PA_BLUEZ4_PROFILE_A2DP_SOURCE || u->profile == PA_BLUEZ4_PROFILE_HEADSET_AUDIO_GATEWAY)
+        transport_acquire(u, optional); /* In case of error, the sink/sources will be created suspended */
+    else if (transport_acquire(u, optional) < 0)
+        return -1; /* We need to fail here until the interactions with module-suspend-on-idle and alike get improved */
 
     return 0;
 }
@@ -1947,10 +1945,12 @@ static int init_profile(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->profile != PA_BLUEZ4_PROFILE_OFF);
 
-    if (setup_transport(u) < 0)
+    if (bt_transport_setup(u) < 0)
         return -1;
 
     pa_assert(u->transport);
+
+    bt_transport_config(u);
 
     if (u->profile == PA_BLUEZ4_PROFILE_A2DP_SINK ||
         u->profile == PA_BLUEZ4_PROFILE_HEADSET_HEAD_UNIT ||
@@ -1972,6 +1972,8 @@ static void stop_thread(struct userdata *u) {
     char *k;
 
     pa_assert(u);
+
+    pa_log_debug("bluez4 stop thread");
 
     if (u->sink && !USE_SCO_OVER_PCM(u))
         pa_sink_unlink(u->sink);
@@ -2046,7 +2048,8 @@ static int start_thread(struct userdata *u) {
     }
 
     if (USE_SCO_OVER_PCM(u)) {
-        if (sco_over_pcm_state_update(u, false) < 0) {
+        pa_log_debug("bluez4 start SCO thread");
+        if (sco_over_pcm_state_update(u, true, false) < 0) {
             char *k;
 
             if (u->sink) {
@@ -2061,6 +2064,7 @@ static int start_thread(struct userdata *u) {
                 pa_xfree(k);
                 u->source = NULL;
             }
+            pa_log("bluez4 start SCO thread failed, removing the sink and source");
             return -1;
         }
 
