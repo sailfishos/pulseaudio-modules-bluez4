@@ -33,6 +33,7 @@
 #include <pulse/timeval.h>
 #include <pulse/utf8.h>
 #include <pulse/xmalloc.h>
+#include <pulse/util.h>
 
 #include <pulsecore/i18n.h>
 #include <pulsecore/module.h>
@@ -1008,7 +1009,11 @@ static void thread_func(void *userdata) {
     pa_log_debug("IO Thread starting up");
 
     if (u->core->realtime_scheduling)
+#if PA_CHECK_VERSION(13,0,0)
+        pa_thread_make_realtime(u->core->realtime_priority);
+#else
         pa_make_realtime(u->core->realtime_priority);
+#endif
 
     pa_thread_mq_install(&u->thread_mq);
 
@@ -1407,8 +1412,8 @@ static int sco_over_pcm_state_update(struct userdata *u, bool changed) {
     pa_assert(u);
     pa_assert(USE_SCO_OVER_PCM(u));
 
-    if (PA_SINK_IS_OPENED(pa_sink_get_state(u->hsp.sco_sink)) ||
-        PA_SOURCE_IS_OPENED(pa_source_get_state(u->hsp.sco_source))) {
+    if (PA_SINK_IS_OPENED(u->hsp.sco_sink->state) ||
+        PA_SOURCE_IS_OPENED(u->hsp.sco_source->state)) {
 
         if (u->stream_fd >= 0)
             return 0;
