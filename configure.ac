@@ -563,6 +563,10 @@ else
     AC_MSG_RESULT([no])
 fi
 
+PKG_CHECK_MODULES([PULSEAUDIO], [libpulse >= 12.2 pulsecore >= 12.2 ])
+AC_SUBST(PULSEAUDIO_CFLAGS)
+AC_SUBST(PULSEAUDIO_LIBS)
+
 #### D-Bus support (optional) ####
 
 AC_ARG_ENABLE([dbus],
