@@ -5,7 +5,7 @@
 Name:       pulseaudio-modules-bluez4
 
 Summary:    Legacy BlueZ4 modules for PulseAudio
-Version:    1.0
+Version:    1.1
 Release:    1
 License:    LGPLv2+
 URL:        https://git.sailfishos.org/mer-core/pulseaudio-modules-bluez4
